@@ -3,11 +3,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from pathlib import Path
-import io
 
 # 페이지 설정
 st.set_page_config(
-    page_title="암호화폐 거래 분석",
+    page_title="거래 분석기",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -16,242 +15,215 @@ st.set_page_config(
 # 스타일 설정
 st.markdown("""
     <style>
-    .main {
-        padding: 0rem 1rem;
-    }
-    .stButton>button {
-        width: 100%;
-    }
-    .reportview-container .main .block-container {
-        padding-top: 2rem;
+    .big-font {
+        font-size:20px !important;
+        font-weight: bold;
     }
     </style>
     """, unsafe_allow_html=True)
 
-def read_data_file(uploaded_file):
-    """CSV 또는 Excel 파일 읽기"""
-    try:
-        # 파일 확장자 확인
-        file_extension = Path(uploaded_file.name).suffix.lower()
-        
-        if file_extension == '.csv':
-            # CSV 파일 읽기 (인코딩 자동 감지)
-            try:
-                return pd.read_csv(uploaded_file)
-            except UnicodeDecodeError:
-                # UTF-8 실패시 cp949 시도
-                uploaded_file.seek(0)  # 파일 포인터 리셋
-                return pd.read_csv(uploaded_file, encoding='cp949')
-        else:
-            # Excel 파일 읽기
-            return pd.read_excel(uploaded_file)
+def analyze_trading_amounts(df, leverage):
+    """거래 데이터 분석"""
+    # 데이터 전처리
+    df = df.copy()
+    df = df.iloc[::-1].reset_index(drop=True)  # 시간순 정렬
+    
+    # 엔트리 데이터만 필터링
+    entries = df[df['타입'] == '엔트리 롱'].copy()
+    
+    # 전체 매수 신호 통계
+    signal_counts = entries['신호'].value_counts()
+    total_trades = len(entries)
+    
+    # 시간순으로 정렬된 매수 그룹 분석
+    trade_groups = []
+    current_group = None
+    current_contracts = 0
+    current_amount = 0
+    current_signals = []
+    max_drawdown = 0
+    max_runup = 0
+    
+    for idx, row in entries.iterrows():
+        if current_group is None or row['신호'] == '매수':  # 새로운 그룹 시작
+            if current_group is not None:
+                trade_groups.append({
+                    '시작시간': current_group['시작시간'],
+                    '종료시간': prev_row['날짜/시간'],
+                    '계약수': current_contracts,
+                    '필요증거금': current_amount,
+                    '신호목록': current_signals,
+                    '시작가격': current_group['시작가격'],
+                    '최대손실': max_drawdown,
+                    '최대이익': max_runup,
+                    '매수횟수': len(current_signals)
+                })
             
-    except Exception as e:
-        st.error(f"파일 읽기 오류: {str(e)}")
-        return None
-
-def analyze_trading_signals(df, leverage, side_col, time_col, price_col, amount_col):
-    """거래 데이터 분석 함수"""
-    try:
-        # 시간을 datetime 형식으로 변환
-        df[time_col] = pd.to_datetime(df[time_col])
-        
-        # 시간순 오름차순 정렬 (과거 -> 현재)
-        df = df.sort_values(time_col, ascending=True)
-        
-        # '매수'가 포함된 신호만 필터링
-        entry_signals = df[df[side_col].str.contains('매수', case=False)]
-        
-        if entry_signals.empty:
-            st.error("매수 신호가 없습니다. 데이터를 확인해주세요.")
-            return None, None
-        
-        # 필요한 증거금 계산 (계약 × 가격 ÷ 레버리지)
-        entry_signals['필요증거금'] = (entry_signals[amount_col].astype(float) * 
-                                  entry_signals[price_col].astype(float) / leverage)
-        
-        # 결과 저장을 위한 리스트
-        results = []
-        
-        # 매수 그룹 분석 변수
-        current_group_start = None
-        current_group_entries = []
-        
-        # 각 행을 순회하며 매수 그룹 분석
-        for idx, row in entry_signals.iterrows():
-            current_time = row[time_col]
-            current_margin = row['필요증거금']
-            signal_type = row[side_col]
+            # 새 그룹 초기화
+            current_group = {
+                '시작시간': row['날짜/시간'],
+                '시작가격': row['가격 USDT']
+            }
+            current_contracts = row['계약']
+            current_amount = row['계약'] * row['가격 USDT'] / leverage
+            current_signals = [row['신호']]
+            max_drawdown = 0
+            max_runup = 0
+        else:  # 기존 그룹에 추가
+            current_contracts += row['계약']
+            current_amount += row['계약'] * row['가격 USDT'] / leverage
+            current_signals.append(row['신호'])
             
-            if current_group_start is None:
-                # 새로운 그룹 시작
-                current_group_start = current_time
-                current_group_entries = [(current_time, current_margin, signal_type)]
+            # 최대 손실/이익 계산
+            price_change = row['가격 USDT'] - current_group['시작가격']
+            if price_change > 0:
+                max_runup = max(max_runup, price_change * current_contracts)
             else:
-                # 이전 매수와의 시간 간격 확인
-                prev_time = current_group_entries[-1][0]
-                time_diff = (current_time - prev_time).total_seconds()
+                max_drawdown = min(max_drawdown, price_change * current_contracts)
                 
-                if time_diff <= 300:  # 5분 이내의 매수는 같은 그룹으로 처리
-                    current_group_entries.append((current_time, current_margin, signal_type))
-                else:
-                    # 이전 그룹 저장
-                    total_margin = sum(margin for _, margin, _ in current_group_entries)
-                    results.append({
-                        '시작시간': current_group_start,
-                        '종료시간': current_group_entries[-1][0],
-                        '필요증거금합계': total_margin,
-                        '진입횟수': len(current_group_entries),
-                        '개별진입시간': [time.strftime('%Y-%m-%d %H:%M:%S') for time, _, _ in current_group_entries],
-                        '개별진입금액': [f"{margin:.2f}" for _, margin, _ in current_group_entries],
-                        '신호유형': [signal for _, _, signal in current_group_entries]
-                    })
-                    
-                    # 새로운 그룹 시작
-                    current_group_start = current_time
-                    current_group_entries = [(current_time, current_margin, signal_type)]
-        
-        # 마지막 그룹 처리
-        if current_group_entries:
-            total_margin = sum(margin for _, margin, _ in current_group_entries)
-            results.append({
-                '시작시간': current_group_start,
-                '종료시간': current_group_entries[-1][0],
-                '필요증거금합계': total_margin,
-                '진입횟수': len(current_group_entries),
-                '개별진입시간': [time.strftime('%Y-%m-%d %H:%M:%S') for time, _, _ in current_group_entries],
-                '개별진입금액': [f"{margin:.2f}" for _, margin, _ in current_group_entries],
-                '신호유형': [signal for _, _, signal in current_group_entries]
-            })
-        
-        results_df = pd.DataFrame(results)
-        
-        # 통계 정보 추가
-        total_entries = sum(len(entry_times) for entry_times in results_df['개별진입시간'])
-        avg_entries_per_group = total_entries / len(results_df) if len(results_df) > 0 else 0
-        max_margin = results_df['필요증거금합계'].max()
-        
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("매수 분석")
-        st.sidebar.write(f"총 진입 횟수: {total_entries}")
-        st.sidebar.write(f"매수 그룹 수: {len(results_df)}")
-        st.sidebar.write(f"그룹당 평균 진입 횟수: {avg_entries_per_group:.2f}")
-        st.sidebar.write(f"최대 필요증거금: {max_margin:.2f} USDT")
-        
-        return results_df, entry_signals
-        
-    except Exception as e:
-        st.error(f"분석 중 오류 발생: {str(e)}")
-        st.error(f"에러 상세: {str(e.__class__.__name__)}")
-        return None, None
-
-def create_visualizations(results_df):
-    """분석 결과 시각화"""
-    # 필요증거금 변화 그래프
-    fig1 = go.Figure()
-    fig1.add_trace(go.Scatter(x=results_df['시작시간'], y=results_df['필요증거금합계'],
-                             mode='lines+markers', name='필요증거금'))
-    fig1.update_layout(title='시간대별 필요증거금 변화',
-                      xaxis_title='시간',
-                      yaxis_title='필요증거금 (USDT)')
+        prev_row = row
     
-    # 진입횟수 그래프
-    fig2 = go.Figure()
-    fig2.add_trace(go.Bar(x=results_df['시작시간'], y=results_df['진입횟수'],
-                         name='진입횟수'))
-    fig2.update_layout(title='시간대별 진입횟수',
-                      xaxis_title='시간',
-                      yaxis_title='진입횟수')
+    # 마지막 그룹 처리
+    if current_group is not None:
+        trade_groups.append({
+            '시작시간': current_group['시작시간'],
+            '종료시간': prev_row['날짜/시간'],
+            '계약수': current_contracts,
+            '필요증거금': current_amount,
+            '신호목록': current_signals,
+            '시작가격': current_group['시작가격'],
+            '최대손실': max_drawdown,
+            '최대이익': max_runup,
+            '매수횟수': len(current_signals)
+        })
     
-    return fig1, fig2
+    # 결과 DataFrame 생성
+    results_df = pd.DataFrame(trade_groups)
+    
+    return results_df, signal_counts, total_trades
 
-# 메인 앱
+def create_margin_timeline(results_df):
+    """증거금 변화 시각화"""
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=results_df['시작시간'],
+        y=results_df['필요증거금'],
+        mode='lines+markers',
+        name='필요증거금',
+        hovertemplate='시간: %{x}<br>필요증거금: %{y:.2f} USDT<br>매수횟수: %{text}<extra></extra>',
+        text=results_df['매수횟수']
+    ))
+    
+    fig.update_layout(
+        title='시간별 필요증거금 변화',
+        xaxis_title='시간',
+        yaxis_title='필요증거금 (USDT)',
+        hovermode='x unified'
+    )
+    
+    return fig
+
+def create_trade_counts_chart(signal_counts):
+    """매수 신호별 횟수 시각화"""
+    fig = go.Figure(data=[
+        go.Bar(
+            x=signal_counts.index,
+            y=signal_counts.values,
+            text=signal_counts.values,
+            textposition='auto',
+        )
+    ])
+    
+    fig.update_layout(
+        title='매수 신호별 횟수',
+        xaxis_title='매수 신호',
+        yaxis_title='횟수',
+        showlegend=False
+    )
+    
+    return fig
+
 def main():
-    st.title("암호화폐 거래 분석 도구 📊")
+    st.title("거래 분석기 📊")
     st.write("거래 데이터를 분석하여 필요 증거금과 매수 패턴을 확인해보세요.")
-
+    
     # 파일 업로드
     uploaded_file = st.file_uploader(
-        "거래 데이터 파일을 업로드하세요 (CSV 또는 Excel)",
-        type=['csv', 'xlsx', 'xls']
+        "거래 데이터 파일을 업로드하세요 (CSV)",
+        type=['csv']
     )
-
-    if uploaded_file is not None:
-        # 데이터 읽기
-        df = read_data_file(uploaded_file)
-        
-        if df is not None:
-            # 데이터 미리보기
-            st.subheader("데이터 미리보기")
-            st.dataframe(df.head())
-            
-            # 컬럼 정보 표시
-            st.subheader("데이터 구조")
-            st.write("사용 가능한 컬럼:")
-            for col in df.columns:
-                st.code(col)
-            
-            # 사이드바에 파라미터 입력
-            with st.sidebar:
-                st.header("분석 파라미터 설정")
-                leverage = st.number_input("레버리지 배수", min_value=1.0, value=10.0, step=0.1)
-                
-                # 컬럼 선택
-                st.subheader("컬럼 매핑")
-                side_col = st.selectbox("매수/매도 구분 컬럼", df.columns)
-                time_col = st.selectbox("시간 컬럼", df.columns)
-                price_col = st.selectbox("가격 컬럼", df.columns)
-                amount_col = st.selectbox("수량 컬럼", df.columns)
-                
-                analyze_button = st.button("분석 시작")
-            
-            if analyze_button:
-                # 분석 실행
-                results_df, entry_signals = analyze_trading_signals(
-                    df, leverage, side_col, time_col, price_col, amount_col
-                )
-                
-                if results_df is not None and entry_signals is not None:
-                    # 주요 지표 표시
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("전체 거래 수", len(df))
-                    with col2:
-                        st.metric("총 진입 횟수", len(entry_signals))
-                    with col3:
-                        st.metric("진입 그룹 수", len(results_df))
-                    
-                    col4, col5, col6 = st.columns(3)
-                    with col4:
-                        st.metric("최대 필요증거금", f"{results_df['필요증거금합계'].max():.2f} USDT")
-                    with col5:
-                        st.metric("평균 필요증거금", f"{results_df['필요증거금합계'].mean():.2f} USDT")
-                    with col6:
-                        st.metric("총 필요증거금", f"{results_df['필요증거금합계'].sum():.2f} USDT")
-                    
-                    # 시각화
-                    fig1, fig2 = create_visualizations(results_df)
-                    st.plotly_chart(fig1, use_container_width=True)
-                    st.plotly_chart(fig2, use_container_width=True)
-                    
-                    # 상세 분석 결과
-                    st.subheader("상세 분석 결과")
-                    st.dataframe(results_df)
-                    
-                    # 결과 다운로드 버튼
-                    st.download_button(
-                        label="분석 결과 다운로드 (CSV)",
-                        data=results_df.to_csv(index=False).encode('utf-8'),
-                        file_name='trading_analysis_results.csv',
-                        mime='text/csv'
-                    )
-
-    else:
-        st.info("CSV 또는 Excel 파일을 업로드하면 분석이 시작됩니다.")
     
-    # 푸터
-    st.markdown("---")
-    st.markdown("Made with ❤️ for crypto traders")
+    if uploaded_file is not None:
+        # 레버리지 설정
+        leverage = st.number_input("레버리지 설정", min_value=1, max_value=100, value=10)
+        
+        try:
+            # 데이터 읽기
+            df = pd.read_csv(uploaded_file)
+            
+            # 데이터 분석
+            results, signal_counts, total_trades = analyze_trading_amounts(df, leverage)
+            
+            # 최대 필요증거금 정보 표시
+            max_margin_point = results.loc[results['필요증거금'].idxmax()]
+            max_trades_point = results.loc[results['매수횟수'].idxmax()]
+            
+            # 주요 지표 표시
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("총 거래 그룹 수", f"{len(results):,}")
+                st.metric("총 매수 횟수", f"{total_trades:,}")
+            with col2:
+                st.metric("최대 필요증거금", f"{max_margin_point['필요증거금']:.2f} USDT")
+                st.metric("해당 시점 매수횟수", f"{max_margin_point['매수횟수']:,}")
+            with col3:
+                st.metric("최대 매수횟수", f"{max_trades_point['매수횟수']:,}")
+                st.metric("해당 시점 증거금", f"{max_trades_point['필요증거금']:.2f} USDT")
+            
+            # 매수 신호별 횟수 차트
+            col1, col2 = st.columns(2)
+            with col1:
+                st.plotly_chart(create_trade_counts_chart(signal_counts), use_container_width=True)
+            with col2:
+                st.subheader("매수 신호별 통계")
+                st.dataframe(pd.DataFrame({
+                    '신호': signal_counts.index,
+                    '횟수': signal_counts.values,
+                    '비율': (signal_counts.values / total_trades * 100).round(2)
+                }).style.format({'비율': '{:.2f}%'}))
+            
+            # 증거금 변화 그래프
+            st.plotly_chart(create_margin_timeline(results), use_container_width=True)
+            
+            # 상세 데이터 표시
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("최대 필요증거금 Top 10")
+                st.dataframe(results.nlargest(10, '필요증거금')[
+                    ['시작시간', '종료시간', '계약수', '필요증거금', '매수횟수', '신호목록']
+                ])
+            with col2:
+                st.subheader("최대 매수횟수 Top 10")
+                st.dataframe(results.nlargest(10, '매수횟수')[
+                    ['시작시간', '종료시간', '계약수', '필요증거금', '매수횟수', '신호목록']
+                ])
+            
+            # 전체 데이터 다운로드 버튼
+            csv = results.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "전체 분석 결과 다운로드 (CSV)",
+                csv,
+                "trade_analysis_results.csv",
+                "text/csv",
+                key='download-csv'
+            )
+            
+        except Exception as e:
+            st.error(f"데이터 분석 중 오류가 발생했습니다: {str(e)}")
+            
+    else:
+        st.info("CSV 파일을 업로드하면 분석이 시작됩니다.")
 
 if __name__ == "__main__":
     main()
