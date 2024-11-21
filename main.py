@@ -25,112 +25,89 @@ def analyze_trading_amounts(df, leverage):
     df = df.copy()
     df = df.iloc[::-1].reset_index(drop=True)
     
-    # 신호에서 숫자 제거하고 기본 신호만 추출
-    df['기본신호'] = df['신호'].str.extract(r'(롱진입|숏진입|롱%추매|숏%추매|롱R추매|숏R추매|매수)')
+    # 진입 신호 패턴
+    pattern = r'(롱진입.*?|숏진입.*?|롱%추매|숏%추매|롱R추매|숏R추매|첫진입|일반추매|M롱$|M롱추매|R롱|매수|E추매|%추매|바닥|동적긴급추매)'
     
     # 엔트리 데이터만 필터링
     entries = df[df['타입'].str.contains('엔트리')].copy()
+    entries['기본신호'] = entries['신호'].str.extract(pattern)[0]
     
-    # 전체 매수 신호 통계
-    signal_counts = entries['기본신호'].value_counts()
-    total_trades = len(entries)
+    # 첫 진입 신호 패턴 (전략별로 다름)
+    initial_signals = ['매수', '첫진입', 'M롱', 'R롱', '롱진입', '숏진입']
     
-    # 시간순으로 정렬된 매매 그룹 분석
+    # 거래 그룹 분석
     trade_groups = []
     current_group = None
     current_contracts = 0
     current_amount = 0
     current_signals = []
-    max_drawdown = 0
-    max_runup = 0
     
     for idx, row in entries.iterrows():
-        is_new_group = (current_group is None or 
-                       (row['기본신호'] in ['롱진입', '롱%추매', '롱R추매', '매수'] and current_group.get('포지션') != 'long') or
-                       (row['기본신호'] in ['숏진입', '숏%추매', '숏R추매'] and current_group.get('포지션') != 'short'))
+        signal = row['기본신호']
+        if pd.isna(signal):
+            continue
+            
+        # 새로운 거래 그룹 시작 조건
+        is_new_group = (current_group is None) or (signal in initial_signals)
         
         if is_new_group:
             if current_group is not None:
                 trade_groups.append({
                     '시작시간': current_group['시작시간'],
                     '종료시간': prev_row['날짜/시간'],
+                    '거래번호': current_group['거래번호'],
                     '계약수': current_contracts,
                     '필요증거금': current_amount,
                     '신호목록': current_signals,
-                    '시작가격': current_group['시작가격'],
-                    '최대손실': max_drawdown,
-                    '최대이익': max_runup,
-                    '매수횟수': len(current_signals),
-                    '포지션': current_group['포지션']
+                    '매수횟수': len(current_signals)
                 })
             
             current_group = {
                 '시작시간': row['날짜/시간'],
-                '시작가격': row['가격 USDT'],
-                '포지션': 'long' if row['기본신호'] in ['롱진입', '롱%추매', '롱R추매', '매수'] else 'short'
+                '거래번호': row['거래 #']
             }
             current_contracts = row['계약']
             current_amount = row['계약'] * row['가격 USDT'] / leverage
-            current_signals = [row['기본신호']]
-            max_drawdown = 0
-            max_runup = 0
+            current_signals = [signal]
         else:
             current_contracts += row['계약']
             current_amount += row['계약'] * row['가격 USDT'] / leverage
-            current_signals.append(row['기본신호'])
-            
-            price_change = row['가격 USDT'] - current_group['시작가격']
-            if current_group['포지션'] == 'short':
-                price_change = -price_change
-                
-            if price_change > 0:
-                max_runup = max(max_runup, price_change * current_contracts)
-            else:
-                max_drawdown = min(max_drawdown, price_change * current_contracts)
+            current_signals.append(signal)
         
         prev_row = row
     
+    # 마지막 그룹 처리
     if current_group is not None:
         trade_groups.append({
             '시작시간': current_group['시작시간'],
             '종료시간': prev_row['날짜/시간'],
+            '거래번호': current_group['거래번호'],
             '계약수': current_contracts,
             '필요증거금': current_amount,
             '신호목록': current_signals,
-            '시작가격': current_group['시작가격'],
-            '최대손실': max_drawdown,
-            '최대이익': max_runup,
-            '매수횟수': len(current_signals),
-            '포지션': current_group['포지션']
+            '매수횟수': len(current_signals)
         })
     
     results_df = pd.DataFrame(trade_groups)
+    signal_counts = entries['기본신호'].value_counts()
+    total_trades = len(entries)
     
     return results_df, signal_counts, total_trades
-
 
 def create_margin_timeline(results_df):
     """증거금 변화 시각화"""
     fig = go.Figure()
     
-    # 롱/숏 포지션별로 다른 색상 사용
-    colors = {'long': 'rgba(99, 110, 250, 0.8)', 'short': 'rgba(239, 85, 59, 0.8)'}
-    
-    for position in ['long', 'short']:
-        position_df = results_df[results_df['포지션'] == position]
-        
-        if len(position_df) > 0:
-            fig.add_trace(go.Scatter(
-                x=position_df['시작시간'],
-                y=position_df['필요증거금'],
-                mode='lines+markers',
-                name=f"{'롱' if position == 'long' else '숏'} 포지션",
-                marker=dict(size=8),
-                line=dict(color=colors[position]),
-                hovertemplate='시간: %{x}<br>필요증거금: %{y:.2f} USDT<br>매수횟수: %{text}<br>포지션: ' + 
-                            ('롱' if position == 'long' else '숏') + '<extra></extra>',
-                text=position_df['매수횟수']
-            ))
+    fig.add_trace(go.Scatter(
+        x=results_df['시작시간'],
+        y=results_df['필요증거금'],
+        mode='lines+markers',
+        name='필요증거금',
+        marker=dict(size=8),
+        line=dict(color='rgba(99, 110, 250, 0.8)'),
+        hovertemplate='시간: %{x}<br>필요증거금: %{y:.2f} USDT<br>매수횟수: %{text}<extra></extra>',
+        text=results_df['매수횟수']
+    ))
     
     fig.update_layout(
         title='시간별 필요증거금 변화',
@@ -141,6 +118,7 @@ def create_margin_timeline(results_df):
     
     return fig
 
+
 def create_trade_counts_chart(signal_counts):
     """매수 신호별 횟수 시각화"""
     fig = go.Figure(data=[
@@ -149,8 +127,7 @@ def create_trade_counts_chart(signal_counts):
             y=signal_counts.values,
             text=signal_counts.values,
             textposition='auto',
-            marker_color=['rgba(99, 110, 250, 0.8)' if '롱' in x else 'rgba(239, 85, 59, 0.8)' 
-                         for x in signal_counts.index]
+            marker_color='rgba(99, 110, 250, 0.8)'
         )
     ])
     
@@ -211,12 +188,12 @@ def main():
             with col1:
                 st.subheader("최대 필요증거금 Top 10")
                 st.dataframe(results.nlargest(10, '필요증거금')[
-                    ['시작시간', '종료시간', '계약수', '필요증거금', '매수횟수', '신호목록', '포지션']
+                    ['시작시간', '종료시간', '계약수', '필요증거금', '매수횟수', '신호목록']
                 ])
             with col2:
                 st.subheader("최대 매수횟수 Top 10")
                 st.dataframe(results.nlargest(10, '매수횟수')[
-                    ['시작시간', '종료시간', '계약수', '필요증거금', '매수횟수', '신호목록', '포지션']
+                    ['시작시간', '종료시간', '계약수', '필요증거금', '매수횟수', '신호목록']
                 ])
             
             csv = results.to_csv(index=False).encode('utf-8')
