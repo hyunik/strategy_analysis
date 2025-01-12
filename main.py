@@ -21,8 +21,15 @@ def calculate_time_difference(start_time, end_time):
     minutes = (diff.seconds % 3600) // 60
     return f"{days}일 {hours}시간 {minutes}분"
 
-def calculate_margin_requirements(df, leverage):
-    entry_signals = ['매수', 'E추매', '바닥', '%추매', '동적긴급추매']
+def get_strategy_signals(strategy):
+    if strategy == 'ATM':
+        return ['매수', 'E추매', '바닥', '%추매', '동적긴급추매']
+    elif strategy == 'BRM':
+        return ['매수', '추매']
+    return []
+
+def calculate_margin_requirements(df, leverage, strategy):
+    entry_signals = get_strategy_signals(strategy)
     buy_positions = df[df['신호'] == '매수'].index.tolist()
     trade_sections = []
     
@@ -32,7 +39,7 @@ def calculate_margin_requirements(df, leverage):
         
         # 매수 관련 신호 필터링
         section_entries = section_df[section_df['신호'].isin(entry_signals)].copy()
-        # 익절/손절 찾기 (현재 구간의 마지막 거래)
+        # 익절/손절 찾기
         exit_trade = section_df.iloc[-1]
         
         # 증거금 계산
@@ -63,21 +70,19 @@ def calculate_margin_requirements(df, leverage):
     
     return pd.DataFrame(trade_sections)
 
-def display_max_margin_analysis(trade_sections):
+def display_max_margin_analysis(trade_sections, strategy):
     st.header('최대 증거금 구간 분석')
     
-    # 최대 증거금 구간 찾기
     max_margin_section = trade_sections.loc[trade_sections['총_증거금'].idxmax()]
     
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric('최대 필요 증거금', f"${max_margin_section['총_증거금']:.2f}")
     with col2:
-        st.metric('총 추매 횟수', str(max_margin_section['매수횟수']))
+        st.metric('총 진입 횟수', str(max_margin_section['매수횟수']))
     with col3:
         st.metric('소요 시간', max_margin_section['소요시간'])
     
-    # 추가 정보 표시
     st.write('### 거래 상세 정보')
     col1, col2 = st.columns(2)
     with col1:
@@ -89,7 +94,6 @@ def display_max_margin_analysis(trade_sections):
         st.write(f"청산 가격: ${max_margin_section['청산가격']:.2f}")
         st.write(f"수익: ${max_margin_section['수익']:.2f} ({max_margin_section['수익률']:.2f}%)")
     
-    # 신호별 분석
     st.write('### 신호별 분석')
     signal_df = pd.DataFrame({
         '신호': list(max_margin_section['신호별_횟수'].keys()),
@@ -98,13 +102,11 @@ def display_max_margin_analysis(trade_sections):
     })
     st.dataframe(signal_df)
     
-    # 상세 거래 내역
     st.write('### 상세 거래 내역')
     detail_df = pd.DataFrame(max_margin_section['상세거래'])
     detail_df['누적_증거금'] = detail_df['증거금'].cumsum()
     st.dataframe(detail_df)
     
-    # 누적 증거금 차트
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=detail_df['날짜/시간'],
@@ -116,12 +118,12 @@ def display_max_margin_analysis(trade_sections):
     st.plotly_chart(fig)
 
 def main():
-    st.title('ATM 거래 전략 분석기')
+    st.title('트레이딩 전략 분석기')
     
     st.sidebar.header('전략 설정')
     strategy = st.sidebar.selectbox(
         '전략 선택',
-        ['ATM', 'Future strategies...']
+        ['ATM', 'BRM']
     )
     
     leverage = st.sidebar.number_input('레버리지 설정', min_value=1, value=20, step=1)
@@ -133,21 +135,49 @@ def main():
             df = load_data(uploaded_file)
             
             if df is not None:
-                trade_sections = calculate_margin_requirements(df, leverage)
+                trade_sections = calculate_margin_requirements(df, leverage, strategy)
                 
                 # 최대 증거금 구간 분석
-                display_max_margin_analysis(trade_sections)
+                display_max_margin_analysis(trade_sections, strategy)
                 
-                # 전체 구간 기본 통계
+                # 전체 구간 통계
                 st.header('전체 거래 통계')
-                total_trades = len(trade_sections)
+                
+                # 익절 유형 분석
+                exit_types = trade_sections['청산종류'].value_counts()
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("### 익절 유형 분포")
+                    st.dataframe(pd.DataFrame({
+                        '익절유형': exit_types.index,
+                        '횟수': exit_types.values,
+                        '비율(%)': (exit_types.values / len(trade_sections) * 100).round(2)
+                    }))
+                
+                with col2:
+                    fig = px.pie(values=exit_types.values, names=exit_types.index, title='익절 유형 비율')
+                    st.plotly_chart(fig)
+                
+                # 증거금 분포 분석
+                st.write("### 증거금 분포")
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric('총 매수 구간 수', str(total_trades))
-                with col2:
                     st.metric('평균 필요 증거금', f"${trade_sections['총_증거금'].mean():.2f}")
+                with col2:
+                    st.metric('중간값 필요 증거금', f"${trade_sections['총_증거금'].median():.2f}")
                 with col3:
-                    st.metric('최소 필요 증거금', f"${trade_sections['총_증거금'].min():.2f}")
+                    st.metric('표준편차', f"${trade_sections['총_증거금'].std():.2f}")
+                
+                # 증거금 분포 히스토그램
+                fig = px.histogram(
+                    trade_sections, 
+                    x='총_증거금',
+                    title='거래별 필요 증거금 분포',
+                    labels={'총_증거금': '필요 증거금 (USDT)'},
+                    nbins=20
+                )
+                st.plotly_chart(fig)
                 
                 # 구간별 상세 분석
                 st.header('매수 구간별 상세 분석')
@@ -164,11 +194,10 @@ def main():
                     with col1:
                         st.metric('필요 증거금', f"${section_data['총_증거금']:.2f}")
                     with col2:
-                        st.metric('추매 횟수', str(section_data['매수횟수']))
+                        st.metric('진입 횟수', str(section_data['매수횟수']))
                     with col3:
                         st.metric('소요 시간', section_data['소요시간'])
                     
-                    # 신호별 분석
                     st.write('### 신호별 분석')
                     signal_df = pd.DataFrame({
                         '신호': list(section_data['신호별_횟수'].keys()),
@@ -177,13 +206,11 @@ def main():
                     })
                     st.dataframe(signal_df)
                     
-                    # 상세 거래 내역
                     st.write('### 상세 거래 내역')
                     detail_df = pd.DataFrame(section_data['상세거래'])
                     detail_df['누적_증거금'] = detail_df['증거금'].cumsum()
                     st.dataframe(detail_df)
                     
-                    # 누적 증거금 차트
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(
                         x=detail_df['날짜/시간'],
